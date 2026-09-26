@@ -1,160 +1,175 @@
+import { useEffect, useMemo, useRef, useState } from "react";
 import "./styles.css";
+import { SAMPLE_BY_ID, STRUCTURES } from "./data/observation";
+import {
+  applyCellClick,
+  isStructureAllowed,
+  reviewObservation,
+  type AnnotationTool,
+  type GridIssue,
+  type Marks,
+} from "./rules/observationRules";
+import {
+  DEFAULT_DRAFT,
+  loadDraft,
+  loadRecords,
+  persistDraft,
+  persistRecords,
+  type DraftState,
+  type ObservationRecord,
+} from "./storage/localStore";
+import { ControlPanel } from "./components/ControlPanel";
+import { GridBoard } from "./components/GridBoard";
+import { RecordsPanel } from "./components/RecordsPanel";
 
-const project = {
-  "id": "hxwl-06",
-  "port": 5106,
-  "title": "显微镜玻片观察",
-  "subtitle": "样本、多倍率视野与染色观察记录库",
-  "stack": "React + Vite + TypeScript + CSS",
-  "theme": [
-    "#4338ca",
-    "#0d9488",
-    "#db2777"
-  ],
-  "domain": "生物显微观察",
-  "users": [
-    "实验课教师",
-    "学生",
-    "实验管理员"
-  ],
-  "metrics": [
-    "样本数",
-    "视野记录",
-    "染色方法",
-    "重点结构"
-  ],
-  "filters": [
-    "植物组织",
-    "动物组织",
-    "微生物",
-    "血液涂片"
-  ],
-  "fields": [
-    "样本名称",
-    "样本类型",
-    "染色方式",
-    "放大倍数",
-    "观察结构",
-    "视野描述"
-  ],
-  "records": [
-    [
-      "洋葱表皮",
-      "植物组织",
-      "碘液",
-      "400x",
-      "细胞壁清晰，细胞核可见"
-    ],
-    [
-      "人血涂片",
-      "血液涂片",
-      "瑞氏染色",
-      "1000x",
-      "红细胞分布均匀"
-    ],
-    [
-      "草履虫",
-      "微生物",
-      "活体观察",
-      "200x",
-      "纤毛运动明显"
-    ]
-  ]
-};
+function formatSavedAt(iso: string): string {
+  if (!iso) {
+    return "尚未保存";
+  }
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) {
+    return "已保存";
+  }
+  return `已自动保存于 ${date.toLocaleString("zh-CN", { hour12: false })}`;
+}
 
-const statusColors = ["status-ok", "status-watch", "status-danger"];
-
-function MetricCard({ label, value, index }: { label: string; value: string; index: number }) {
-  return (
-    <article className="metric-card">
-      <span>{label}</span>
-      <strong>{value}</strong>
-      <i className={statusColors[index % statusColors.length]} />
-    </article>
-  );
+function firstAllowedTool(sampleId: string): AnnotationTool {
+  const sample = SAMPLE_BY_ID[sampleId];
+  const found = STRUCTURES.find((structure) => sample && isStructureAllowed(sample, structure.id));
+  return found ? found.id : "erase";
 }
 
 function App() {
-  const values = project.metrics.map((metric: string, index: number) => {
-    const base = [84, 12, 31, 7][index % 4];
-    return String(base + index * 3);
-  });
+  // 关掉页面再打开：样本、倍率、格子从本机草稿找回
+  const [draft, setDraft] = useState<DraftState>(loadDraft);
+  const [records, setRecords] = useState<ObservationRecord[]>(loadRecords);
+  const [tool, setTool] = useState<AnnotationTool>(() => firstAllowedTool(draft.sampleId));
+  const [issues, setIssues] = useState<GridIssue[]>([]);
+  const [notice, setNotice] = useState<{ kind: "info" | "success"; message: string } | null>(null);
+  const noticeTimer = useRef<number | undefined>(undefined);
+
+  // 草稿与记录分开存放：观察资料、判断规则之外，本机保存独立成层
+  useEffect(() => {
+    persistDraft(draft);
+  }, [draft]);
+
+  useEffect(() => {
+    persistRecords(records);
+  }, [records]);
+
+  const sample = SAMPLE_BY_ID[draft.sampleId] ?? SAMPLE_BY_ID[DEFAULT_DRAFT.sampleId];
+  const marks: Marks = draft.marksBySample[draft.sampleId] ?? {};
+
+  const savedAtText = useMemo(() => formatSavedAt(draft.savedAt), [draft.savedAt]);
+
+  function flashNotice(message: string, kind: "info" | "success" = "info") {
+    setNotice({ kind, message });
+    window.clearTimeout(noticeTimer.current);
+    noticeTimer.current = window.setTimeout(() => setNotice(null), 4000);
+  }
+
+  /** 任何草稿改动都会重新打保存时间，并清掉上一次提交留下的审查提示 */
+  function touchDraft(updater: (prev: DraftState) => DraftState) {
+    setDraft((prev) => ({ ...updater(prev), savedAt: new Date().toISOString() }));
+    setIssues([]);
+    setNotice(null);
+  }
+
+  function updateSampleMarks(updater: (marks: Marks) => Marks) {
+    touchDraft((prev) => ({
+      ...prev,
+      marksBySample: {
+        ...prev.marksBySample,
+        [prev.sampleId]: updater(prev.marksBySample[prev.sampleId] ?? {}),
+      },
+    }));
+  }
+
+  function handleSampleChange(sampleId: string) {
+    touchDraft((prev) => ({ ...prev, sampleId }));
+    // 每个样本的格子互相隔离，并把登记工具切到该样本可观察的第一种结构
+    setTool(firstAllowedTool(sampleId));
+  }
+
+  function handleMagnificationChange(next: DraftState["magnification"]) {
+    touchDraft((prev) => ({ ...prev, magnification: next }));
+  }
+
+  function handleCellClick(position: number) {
+    const result = applyCellClick(marks, position, tool, draft.magnification);
+    if (result.rejected) {
+      flashNotice(result.rejected, "info");
+      return;
+    }
+    updateSampleMarks(() => result.next);
+  }
+
+  function handleClear() {
+    updateSampleMarks(() => ({}));
+    flashNotice("已清空当前样本的格子登记（不影响其他样本）。", "info");
+  }
+
+  function handleSubmit() {
+    const found = reviewObservation(sample.id, draft.magnification, marks);
+    if (found.length > 0) {
+      // 重点结构为空 / 格位与当前视野无关：提示留在本页，阻断提交
+      setIssues(found);
+      setNotice(null);
+      return;
+    }
+    const record: ObservationRecord = {
+      id: `rec-${Date.now()}`,
+      sampleId: sample.id,
+      magnification: draft.magnification,
+      marks: { ...marks },
+      createdAt: new Date().toISOString(),
+    };
+    setRecords((prev) => [record, ...prev]);
+    // 提交后该样本的格子重新开始，但样本与倍率保留
+    setDraft((prev) => ({
+      ...prev,
+      marksBySample: { ...prev.marksBySample, [prev.sampleId]: {} },
+      savedAt: new Date().toISOString(),
+    }));
+    setIssues([]);
+    setNotice(null);
+    flashNotice("提交成功，可在下方“提交记录筛选”中按样本、倍率和结构回看。", "success");
+  }
 
   return (
     <main className="app-shell">
-      <section className="hero">
-        <div>
-          <p className="eyebrow">{project.id} · port {project.port}</p>
-          <h1>{project.title}</h1>
-          <p className="subtitle">{project.subtitle}</p>
-        </div>
-        <div className="stack-card">
-          <span>技术栈</span>
-          <strong>{project.stack}</strong>
-        </div>
-      </section>
+      <header className="page-header">
+        <p className="eyebrow">hxwl-06 · 显微镜玻片观察</p>
+        <h1>九宫格观察记录</h1>
+        <p className="subtitle">
+          选定样本与倍率后，点格登记细胞壁、细胞核或纤毛；标注按格位随倍率沿用，样本之间互不混存。
+        </p>
+      </header>
 
-      <section className="metrics-grid">
-        {project.metrics.map((metric: string, index: number) => (
-          <MetricCard key={metric} label={metric} value={values[index]} index={index} />
-        ))}
-      </section>
+      <div className="workspace">
+        <ControlPanel
+          sample={sample}
+          magnification={draft.magnification}
+          tool={tool}
+          onSampleChange={handleSampleChange}
+          onMagnificationChange={handleMagnificationChange}
+          onToolChange={setTool}
+          savedAtText={savedAtText}
+        />
+        <GridBoard
+          sample={sample}
+          magnification={draft.magnification}
+          marks={marks}
+          tool={tool}
+          issues={issues}
+          successNotice={notice}
+          onCellClick={handleCellClick}
+          onSubmit={handleSubmit}
+          onClear={handleClear}
+        />
+      </div>
 
-      <section className="workspace">
-        <aside className="panel narrow">
-          <h2>角色</h2>
-          <div className="chips">
-            {project.users.map((user: string) => (
-              <span key={user}>{user}</span>
-            ))}
-          </div>
-          <h2>筛选</h2>
-          <div className="chips muted">
-            {project.filters.map((filter: string) => (
-              <button key={filter}>{filter}</button>
-            ))}
-          </div>
-        </aside>
-
-        <section className="panel">
-          <div className="section-heading">
-            <div>
-              <p>{project.domain}</p>
-              <h2>记录字段</h2>
-            </div>
-            <button className="primary-action">新增记录</button>
-          </div>
-          <div className="field-grid">
-            {project.fields.map((field: string) => (
-              <label key={field}>
-                <span>{field}</span>
-                <input placeholder={"填写" + field} />
-              </label>
-            ))}
-          </div>
-        </section>
-      </section>
-
-      <section className="records panel">
-        <div className="section-heading">
-          <div>
-            <p>示例数据</p>
-            <h2>近期记录</h2>
-          </div>
-          <button>导出摘要</button>
-        </div>
-        <div className="record-list">
-          {project.records.map((record: string[], index: number) => (
-            <article key={record.join("-")} className="record-card">
-              <div className="record-index">{String(index + 1).padStart(2, "0")}</div>
-              <div>
-                <h3>{record[0]}</h3>
-                <p>{record.slice(1).join(" · ")}</p>
-              </div>
-            </article>
-          ))}
-        </div>
-      </section>
+      <RecordsPanel records={records} />
     </main>
   );
 }
